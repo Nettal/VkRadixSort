@@ -9,18 +9,19 @@
 #extension GL_KHR_shader_subgroup_ballot: enable
 
 #define WORKGROUP_SIZE 256// assert WORKGROUP_SIZE >= RADIX_SORT_BINS
-#define RADIX_SORT_BINS 256
+#define RADIX_SORT_BINS 256 // 2^8 一次排8 bit 需要 2^8 个 bin 来存储 prefix block sum
 #define SUBGROUP_SIZE 32// 32 NVIDIA; 64 AMD
 
 #define BITS 32// sorting uint32_t
 
+// WORKGROUP大小
 layout (local_size_x = WORKGROUP_SIZE) in;
 
 layout (push_constant, std430) uniform PushConstants {
     uint g_num_elements;
     uint g_shift;
     uint g_num_workgroups;
-    uint g_num_blocks_per_workgroup;
+    uint g_num_blocks_per_workgroup;// 每个 lane 排序多少 32
 };
 
 layout (std430, set = 1, binding = 0) buffer elements_in {
@@ -32,11 +33,11 @@ layout (std430, set = 1, binding = 1) buffer elements_out {
 };
 
 layout (std430, set = 1, binding = 2) buffer histograms {
-// [histogram_of_workgroup_0 | histogram_of_workgroup_1 | ... ]
+    // [histogram_of_workgroup_0 | histogram_of_workgroup_1 | ... ]
     uint g_histograms[];// |g_histograms| = RADIX_SORT_BINS * #WORKGROUPS = RADIX_SORT_BINS * g_num_workgroups
 };
 
-shared uint[RADIX_SORT_BINS / SUBGROUP_SIZE] sums;// subgroup reductions
+shared uint[RADIX_SORT_BINS / SUBGROUP_SIZE] sums;// subgroup reductions = 8
 shared uint[RADIX_SORT_BINS] global_offsets;// global exclusive scan (prefix sum)
 
 struct BinFlags {
@@ -45,15 +46,25 @@ struct BinFlags {
 shared BinFlags[RADIX_SORT_BINS] bin_flags;
 
 void main() {
-    uint gID = gl_GlobalInvocationID.x;
+    //    uint gID = gl_GlobalInvocationID.x;
     uint lID = gl_LocalInvocationID.x;
     uint wID = gl_WorkGroupID.x;
-    uint sID = gl_SubgroupID;
-    uint lsID = gl_SubgroupInvocationID;
+    uint sID = gl_SubgroupID; // ID of subgroup within local workgroup, [0..gl_NumSubgroups)
 
+    // wID:
+    // 0 : bins[0][lID]
+    // 1 : bins[0][lID] + bins[1][lID]
+    // 2 : bins[0][lID] + bins[1][lID] + bins[2][lID]
     uint local_histogram = 0;
+    // gl_SubgroupInvocationID:
+    // 0: 0
+    // 1: all( bin[lID] )
+    // 2: all( bin[lID - 1, lID] )
+    // 3: all( bin[lID - 2, lID] )
+    // ...
+    // to gl_SubgroupInvocationID - 1
     uint prefix_sum = 0;
-    uint histogram_count = 0;
+    uint histogram_count = 0;// all( bins[lID] )
 
     if (lID < RADIX_SORT_BINS) {
         uint count = 0;
@@ -63,18 +74,40 @@ void main() {
             count += t;
         }
         histogram_count = count;
-        const uint sum = subgroupAdd(histogram_count);
-        prefix_sum = subgroupExclusiveAdd(histogram_count);
+        const uint sum = subgroupAdd(count);
+        prefix_sum = subgroupExclusiveAdd(count);
         if (subgroupElect()) {
             // one thread inside the warp/subgroup enters this section
+            // sID:
+            // 0: all( bin[0, gl_SubgroupSize) )
+            // 1: all( bin[gl_SubgroupSize, 2 * gl_SubgroupSize) )
+            // 2: all( bin[2 * gl_SubgroupSize, 3 * gl_SubgroupSize) )
+            // to gl_NumSubgroups, gl_NumSubgroups * gl_SubgroupSize = RADIX_SORT_BINS
             sums[sID] = sum;
         }
     }
     barrier();
 
     if (lID < RADIX_SORT_BINS) {
-        const uint sums_prefix_sum = subgroupBroadcast(subgroupExclusiveAdd(sums[lsID]), sID);
+        // assert gl_SubgroupSize >= gl_SubgroupID
+        uint lsID = gl_SubgroupInvocationID;// [0..gl_SubgroupSize)
+        // lsID:
+        // 0 : 0
+        // 1 : all( bin[0, gl_SubgroupSize) )
+        // 2 : all( bin[0, 2 * gl_SubgroupSize) )
+        // 3 : all( bin[0, 3 * gl_SubgroupSize) )
+        // ... to gl_NumSubgroups
+        const uint a = subgroupExclusiveAdd(sums[lsID]);
+        // sID: gl_SubgroupID
+        // 0 : 0
+        // 1 : all( bin[0, gl_SubgroupSize) )
+        // 2 : all( bin[0, 2 * gl_SubgroupSize) )
+        // 3 : all( bin[0, 3 * gl_SubgroupSize) )
+        // ... to gl_NumSubgroups
+        const uint sums_prefix_sum = subgroupBroadcast(a, sID);
+        // all( bin[0, lID) )
         const uint global_histogram = sums_prefix_sum + prefix_sum;
+        // all( bin[0, lID) ) + bins[ 0 to wID ][lID]
         global_offsets[lID] = global_histogram + local_histogram;
     }
 
